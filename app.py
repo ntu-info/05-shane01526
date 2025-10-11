@@ -42,6 +42,31 @@ def create_app():
     def get_studies_by_coordinates(coords):
         x, y, z = map(int, coords.split("_"))
         return jsonify([x, y, z])
+    
+    # Added: dissociate by two terms (underscores preserved; also return readable form)
+    @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
+    def dissociate_terms(term_a, term_b):
+        return jsonify({
+            "term_a_raw": term_a,
+            "term_b_raw": term_b,
+            "term_a": term_a.replace("_", " "),
+            "term_b": term_b.replace("_", " "),
+        })
+
+    # Added: dissociate by two coordinate triples (format: x_y_z)
+    @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
+    def dissociate_locations(coords_a, coords_b):
+        def parse_coords(s):
+            parts = s.split("_")
+            if len(parts) != 3:
+                abort(400, f"Invalid coordinates '{s}'")
+            try:
+                return [int(p) for p in parts]
+            except ValueError:
+                abort(400, f"Invalid coordinates '{s}'")
+        a = parse_coords(coords_a)
+        b = parse_coords(coords_b)
+        return jsonify({"a": a, "b": b})
 
     @app.get("/test_db", endpoint="test_db")
     

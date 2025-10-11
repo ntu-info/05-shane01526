@@ -74,20 +74,20 @@ Create a PostgreSQL database (e.g., on Render).
 ### 2) Verify the connection
 
 ```bash
-python check_db.py --url "postgresql://<USER>:<PASSWORD>@<HOST>:5432/<DBNAME>"
+python check_db.py --url "postgresql://neuralinfo_user:QlsPQlF6Nsd6BjkrWgRtO1TyZkXZl3sF@dpg-d3j1pbpr0fns73aiou7g-a.oregon-postgres.render.com/neuralinfo"
 ```
 
 ### 3) Populate the database
 
 ```bash
-python create_db.py --url "postgresql://<USER>:<PASSWORD>@<HOST>:5432/<DBNAME>"
+python create_db.py --url "postgresql://neuralinfo_user:QlsPQlF6Nsd6BjkrWgRtO1TyZkXZl3sF@dpg-d3j1pbpr0fns73aiou7g-a.oregon-postgres.render.com/neuralinfo"
 ```
 
 ### 4) Run the Flask service
 
 Deploy `app.py` as a Web Service (e.g., on Render) and set the environment variable:
 
-- `DB_URL=postgresql://<USER>:<PASSWORD>@<HOST>:5432/<DBNAME>`
+- `postgresql://neuralinfo_user:QlsPQlF6Nsd6BjkrWgRtO1TyZkXZl3sF@dpg-d3j1pbpr0fns73aiou7g-a.oregon-postgres.render.com/neuralinfo`
 
 Use a production server such as Gunicorn as your start command:
 

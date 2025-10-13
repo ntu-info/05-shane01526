@@ -367,6 +367,56 @@ def create_app():
             payload["error"] = str(e)
             return jsonify(payload), 500
 
+        @app.get("/ui", endpoint="ui")
+        def ui():
+                # Minimal single-page UI to query the API endpoints from a browser
+                html = """
+                <!doctype html>
+                <html>
+                <head>
+                    <meta charset="utf-8" />
+                    <title>NeuralInfo — quick UI</title>
+                    <style>body{font-family:system-ui,Arial;max-width:900px;margin:40px;} textarea{width:100%;height:200px}</style>
+                </head>
+                <body>
+                    <h1>NeuralInfo — quick UI</h1>
+                    <section>
+                        <h2>Query by term</h2>
+                        <input id="term" placeholder="posterior_cingulate" style="width:60%" />
+                        <button onclick="runTerm()">Query</button>
+                    </section>
+
+                    <section style="margin-top:18px;">
+                        <h2>Query by coordinates</h2>
+                        <input id="coords" placeholder="0_-52_26" style="width:60%" />
+                        <button onclick="runCoords()">Query</button>
+                    </section>
+
+                    <section style="margin-top:18px;">
+                        <h2>Results</h2>
+                        <textarea id="out" readonly></textarea>
+                    </section>
+
+                    <script>
+                        async function runTerm(){
+                            const t = document.getElementById('term').value.trim();
+                            if(!t){ alert('Enter a term (use underscores for spaces)'); return }
+                            const res = await fetch(`/terms/${encodeURIComponent(t)}/studies`);
+                            const j = await res.json();
+                            document.getElementById('out').value = JSON.stringify(j,null,2);
+                        }
+                        async function runCoords(){
+                            const c = document.getElementById('coords').value.trim();
+                            if(!c){ alert('Enter coords as x_y_z'); return }
+                            const res = await fetch(`/locations/${encodeURIComponent(c)}/studies`);
+                            const j = await res.json();
+                            document.getElementById('out').value = JSON.stringify(j,null,2);
+                        }
+                    </script>
+                </body>
+                </html>
+                """
+                return html
     return app
 
 # WSGI entry point (no __main__)

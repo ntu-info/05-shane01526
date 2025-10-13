@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError, PendingRollbackError
+import time
 
 
 # -----------------------------
@@ -28,7 +30,12 @@ from sqlalchemy.engine import Engine
 # -----------------------------
 def parse_args():
     ap = argparse.ArgumentParser(description="PostgreSQL loader with PostGIS + FTS and accelerated annotations COPY.")
-    ap.add_argument("--url", required=True, help="SQLAlchemy DB URL (postgresql://user:pass@host/db)")
+    ap.add_argument(
+        "--url",
+        required=False,
+        default=os.getenv("DB_URL"),
+        help="SQLAlchemy DB URL (postgresql://user:pass@host/db). Falls back to DB_URL or DATABASE_URL env var if omitted."
+    )
     ap.add_argument("--data-dir", default="./", help="Directory containing Parquet files")
     ap.add_argument("--schema", default="ns", help="Target schema (default: ns)")
     ap.add_argument("--if-exists", choices=["replace", "append"], default="replace", help="Behavior for coordinates/metadata")
@@ -99,8 +106,28 @@ def build_coordinates(engine: Engine, df: pd.DataFrame, schema: str, chunksize: 
         """))
 
     print("→ coordinates: loading staging (to_sql)")
-    df.to_sql("coordinates_stage", engine, schema=schema, if_exists="append", index=False,
-              chunksize=chunksize, method="multi")
+    # to_sql can leave connections in a bad transaction state on some DB errors; retry once
+    def _to_sql_with_retry(engine_obj):
+        try:
+            df.to_sql("coordinates_stage", engine_obj, schema=schema, if_exists="append", index=False,
+                      chunksize=chunksize, method="multi")
+            return None
+        except (OperationalError, PendingRollbackError) as e:
+            return e
+
+    err = _to_sql_with_retry(engine)
+    if err is not None:
+        print("   … detected DB transaction error during to_sql; retrying once after brief sleep")
+        try:
+            time.sleep(1)
+            # Create a fresh engine and retry once
+            new_engine = create_engine(engine.url, pool_pre_ping=True)
+            err2 = _to_sql_with_retry(new_engine)
+            if err2 is not None:
+                raise err2
+            engine = new_engine
+        except Exception:
+            raise
 
     with engine.begin() as conn:
         conn.execute(text(f"""
@@ -147,7 +174,23 @@ def build_metadata(engine: Engine, df: pd.DataFrame, schema: str, if_exists: str
         conn.execute(text(f"CREATE TABLE IF NOT EXISTS {schema}.metadata ({', '.join(cols)});"))
 
     print("→ metadata: bulk inserting (to_sql)")
-    df.to_sql("metadata", engine, schema=schema, if_exists="append", index=False, chunksize=20000, method="multi")
+    # Same retry pattern as coordinates
+    def _meta_to_sql_with_retry(engine_obj):
+        try:
+            df.to_sql("metadata", engine_obj, schema=schema, if_exists="append", index=False, chunksize=20000, method="multi")
+            return None
+        except (OperationalError, PendingRollbackError) as e:
+            return e
+
+    merr = _meta_to_sql_with_retry(engine)
+    if merr is not None:
+        print("   … detected DB transaction error during metadata to_sql; retrying once after brief sleep")
+        time.sleep(1)
+        new_engine = create_engine(engine.url, pool_pre_ping=True)
+        merr2 = _meta_to_sql_with_retry(new_engine)
+        if merr2 is not None:
+            raise merr2
+        engine = new_engine
 
     with engine.begin() as conn:
         res = conn.execute(text(f"""
@@ -292,6 +335,8 @@ def build_annotations(engine: Engine, df: pd.DataFrame, schema: str, batch_cols:
 # -----------------------------
 def main():
     args = parse_args()
+    if not args.url:
+        raise SystemExit("Missing DB URL. Provide --url or set DB_URL environment variable.")
     engine = create_engine(args.url, pool_pre_ping=True)
 
     ensure_schema(engine, args.schema)

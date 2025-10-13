@@ -36,24 +36,193 @@ def create_app():
 
     @app.get("/terms/<term>/studies", endpoint="terms_studies")
     def get_studies_by_term(term):
-        return term
+        # Query DB for studies that mention `term` and include their coords + top terms
+        eng = get_engine()
+        term_norm = term.replace("_", " ").lower()
+        with eng.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT at.study_id, at.contrast_id, at.weight,
+                       ST_X(c.geom) AS x, ST_Y(c.geom) AS y, ST_Z(c.geom) AS z
+                FROM ns.annotations_terms at
+                LEFT JOIN ns.coordinates c ON at.study_id = c.study_id
+                WHERE at.term = :term
+                ORDER BY at.weight DESC
+                LIMIT 100
+            """), {"term": term_norm}).mappings().all()
+
+            # Collect study ids to fetch top terms for each study
+            study_ids = list({r["study_id"] for r in rows})
+            if study_ids:
+                # Build IN clause safely
+                params = {f"id{i}": sid for i, sid in enumerate(study_ids)}
+                in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
+                term_rows = conn.execute(text(f"""
+                    SELECT study_id, term, weight
+                    FROM ns.annotations_terms
+                    WHERE study_id IN ({in_clause})
+                    ORDER BY study_id, weight DESC
+                """), params).mappings().all()
+            else:
+                term_rows = []
+
+        # Aggregate top terms per study (top 5)
+        top_terms = {}
+        for tr in term_rows:
+            sid = tr["study_id"]
+            top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"])})
+
+        result = []
+        for r in rows:
+            sid = r["study_id"]
+            result.append({
+                "study_id": sid,
+                "contrast_id": r["contrast_id"],
+                "weight_for_query_term": float(r["weight"]) if r["weight"] is not None else None,
+                "coords": None if r["x"] is None else [float(r["x"]), float(r["y"]), float(r["z"])],
+                "top_terms": top_terms.get(sid, [])[:5]
+            })
+        return jsonify({"query_term": term_norm, "count": len(result), "studies": result})
 
     @app.get("/locations/<coords>/studies", endpoint="locations_studies")
     def get_studies_by_coordinates(coords):
-        x, y, z = map(int, coords.split("_"))
-        return jsonify([x, y, z])
+        # Find nearest studies to coords and return their coordinates + top terms
+        try:
+            x, y, z = map(float, coords.split("_"))
+        except Exception:
+            abort(400, "Invalid coordinates format; expected x_y_z")
+
+        eng = get_engine()
+        with eng.begin() as conn:
+            # Use KNN ordering (requires PostGIS + GIST on geom). Limit to 50 nearest studies.
+            rows = conn.execute(text("""
+                SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z
+                FROM ns.coordinates
+                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+                LIMIT 50
+            """), {"x": x, "y": y, "z": z}).mappings().all()
+
+            study_ids = [r["study_id"] for r in rows]
+            if study_ids:
+                params = {f"id{i}": sid for i, sid in enumerate(study_ids)}
+                in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
+                term_rows = conn.execute(text(f"""
+                    SELECT study_id, term, weight
+                    FROM ns.annotations_terms
+                    WHERE study_id IN ({in_clause})
+                    ORDER BY study_id, weight DESC
+                """), params).mappings().all()
+            else:
+                term_rows = []
+
+        # Aggregate top terms per study (top 5)
+        top_terms = {}
+        for tr in term_rows:
+            sid = tr["study_id"]
+            top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"])})
+
+        result = []
+        for r in rows:
+            sid = r["study_id"]
+            result.append({
+                "study_id": sid,
+                "coords": [float(r["x"]), float(r["y"]), float(r["z"])],
+                "top_terms": top_terms.get(sid, [])[:5]
+            })
+        return jsonify({"query_coords": [x, y, z], "count": len(result), "nearest": result})
     
-    # Added: dissociate by two terms (underscores preserved; also return readable form)
+    # Updated: dissociate by two terms -> run A\B and B\A against the DB
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_terms(term_a, term_b):
-        return jsonify({
-            "term_a_raw": term_a,
-            "term_b_raw": term_b,
-            "term_a": term_a.replace("_", " "),
-            "term_b": term_b.replace("_", " "),
-        })
+        def norm_term(t):
+            return t.replace("_", " ").strip().lower()
 
-    # Added: dissociate by two coordinate triples (format: x_y_z)
+        a_term = norm_term(term_a)
+        b_term = norm_term(term_b)
+
+        eng = get_engine()
+        try:
+            with eng.begin() as conn:
+                conn.execute(text("SET search_path TO ns, public;"))
+
+                # Get study ids for each term (limit to 1000 to avoid huge IN lists)
+                a_rows = conn.execute(text("""
+                    SELECT DISTINCT study_id
+                    FROM ns.annotations_terms
+                    WHERE term = :term
+                    LIMIT 1000
+                """), {"term": a_term}).scalars().all()
+
+                b_rows = conn.execute(text("""
+                    SELECT DISTINCT study_id
+                    FROM ns.annotations_terms
+                    WHERE term = :term
+                    LIMIT 1000
+                """), {"term": b_term}).scalars().all()
+
+                a_ids = set(a_rows)
+                b_ids = set(b_rows)
+
+                a_only_ids = list(a_ids - b_ids)
+                b_only_ids = list(b_ids - a_ids)
+                overlap_ids = list(a_ids & b_ids)
+
+                def fetch_details(study_ids):
+                    if not study_ids:
+                        return []
+                    params = {f"id{i}": sid for i, sid in enumerate(study_ids)}
+                    in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
+
+                    coords_rows = conn.execute(text(f"""
+                        SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z
+                        FROM ns.coordinates
+                        WHERE study_id IN ({in_clause})
+                    """), params).mappings().all()
+
+                    term_rows = conn.execute(text(f"""
+                        SELECT study_id, term, weight
+                        FROM ns.annotations_terms
+                        WHERE study_id IN ({in_clause})
+                        ORDER BY study_id, weight DESC
+                    """), params).mappings().all()
+
+                    top_terms = {}
+                    for tr in term_rows:
+                        sid = tr["study_id"]
+                        top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"]) if tr["weight"] is not None else None})
+
+                    coords_map = {r["study_id"]: [float(r["x"]), float(r["y"]), float(r["z"])] if r["x"] is not None else None for r in coords_rows}
+
+                    results = []
+                    for sid in study_ids:
+                        results.append({
+                            "study_id": sid,
+                            "coords": coords_map.get(sid),
+                            "top_terms": top_terms.get(sid, [])[:5]
+                        })
+                    return results
+
+                a_only = fetch_details(a_only_ids)
+                b_only = fetch_details(b_only_ids)
+                overlap = fetch_details(overlap_ids)
+
+            return jsonify({
+                "term_a_raw": term_a,
+                "term_b_raw": term_b,
+                "term_a": a_term,
+                "term_b": b_term,
+                "a_only_count": len(a_only),
+                "b_only_count": len(b_only),
+                "overlap_count": len(overlap),
+                "a_only": a_only,
+                "b_only": b_only,
+                "overlap": overlap
+            }), 200
+        except OperationalError as e:
+            abort(500, f"DB error: {e}")
+        except Exception as e:
+            abort(500, str(e))
+
+    # Updated: dissociate by two coordinate triples -> nearest-based A\B and B\A
     @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
     def dissociate_locations(coords_a, coords_b):
         def parse_coords(s):
@@ -61,12 +230,94 @@ def create_app():
             if len(parts) != 3:
                 abort(400, f"Invalid coordinates '{s}'")
             try:
-                return [int(p) for p in parts]
+                return [float(p) for p in parts]
             except ValueError:
                 abort(400, f"Invalid coordinates '{s}'")
+
         a = parse_coords(coords_a)
         b = parse_coords(coords_b)
-        return jsonify({"a": a, "b": b})
+
+        eng = get_engine()
+        try:
+            with eng.begin() as conn:
+                conn.execute(text("SET search_path TO ns, public;"))
+
+                # Find nearest N studies to each point (use KNN). Adjust SRID if different.
+                N = 100
+                a_rows = conn.execute(text("""
+                    SELECT study_id
+                    FROM ns.coordinates
+                    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+                    LIMIT :n
+                """), {"x": a[0], "y": a[1], "z": a[2], "n": N}).scalars().all()
+
+                b_rows = conn.execute(text("""
+                    SELECT study_id
+                    FROM ns.coordinates
+                    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+                    LIMIT :n
+                """), {"x": b[0], "y": b[1], "z": b[2], "n": N}).scalars().all()
+
+                a_ids = set(a_rows)
+                b_ids = set(b_rows)
+
+                a_only_ids = list(a_ids - b_ids)
+                b_only_ids = list(b_ids - a_ids)
+                overlap_ids = list(a_ids & b_ids)
+
+                def fetch_details(study_ids):
+                    if not study_ids:
+                        return []
+                    params = {f"id{i}": sid for i, sid in enumerate(study_ids)}
+                    in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
+
+                    coords_rows = conn.execute(text(f"""
+                        SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z
+                        FROM ns.coordinates
+                        WHERE study_id IN ({in_clause})
+                    """), params).mappings().all()
+
+                    term_rows = conn.execute(text(f"""
+                        SELECT study_id, term, weight
+                        FROM ns.annotations_terms
+                        WHERE study_id IN ({in_clause})
+                        ORDER BY study_id, weight DESC
+                    """), params).mappings().all()
+
+                    top_terms = {}
+                    for tr in term_rows:
+                        sid = tr["study_id"]
+                        top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"]) if tr["weight"] is not None else None})
+
+                    coords_map = {r["study_id"]: [float(r["x"]), float(r["y"]), float(r["z"])] if r["x"] is not None else None for r in coords_rows}
+
+                    results = []
+                    for sid in study_ids:
+                        results.append({
+                            "study_id": sid,
+                            "coords": coords_map.get(sid),
+                            "top_terms": top_terms.get(sid, [])[:5]
+                        })
+                    return results
+
+                a_only = fetch_details(a_only_ids)
+                b_only = fetch_details(b_only_ids)
+                overlap = fetch_details(overlap_ids)
+
+            return jsonify({
+                "query_a": a,
+                "query_b": b,
+                "a_only_count": len(a_only),
+                "b_only_count": len(b_only),
+                "overlap_count": len(overlap),
+                "a_only": a_only,
+                "b_only": b_only,
+                "overlap": overlap
+            }), 200
+        except OperationalError as e:
+            abort(500, f"DB error: {e}")
+        except Exception as e:
+            abort(500, str(e))
 
     @app.get("/test_db", endpoint="test_db")
     

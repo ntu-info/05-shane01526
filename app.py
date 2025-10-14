@@ -376,10 +376,11 @@ def create_app():
                 <head>
                     <meta charset="utf-8" />
                     <title>NeuralInfo — quick UI</title>
-                    <style>body{font-family:system-ui,Arial;max-width:900px;margin:40px;} textarea{width:100%;height:200px}</style>
+                    <style>body{font-family:system-ui,Arial;max-width:900px;margin:40px;} textarea{width:100%;height:320px}</style>
                 </head>
                 <body>
                     <h1>NeuralInfo — quick UI</h1>
+
                     <section>
                         <h2>Query by term</h2>
                         <input id="term" placeholder="posterior_cingulate" style="width:60%" />
@@ -393,24 +394,49 @@ def create_app():
                     </section>
 
                     <section style="margin-top:18px;">
+                        <h2>Dissociate by two terms</h2>
+                        <input id="term_a" placeholder="ventromedial_prefrontal" style="width:28%" />
+                        <input id="term_b" placeholder="posterior_cingulate" style="width:28%;margin-left:8px;" />
+                        <button onclick="runDissociateTerms()">Dissociate Terms</button>
+                    </section>
+
+                    <section style="margin-top:18px;">
                         <h2>Results</h2>
                         <textarea id="out" readonly></textarea>
                     </section>
 
                     <script>
+                        async function handleResponse(res){
+                            let txt;
+                            try{
+                                const j = await res.json();
+                                txt = JSON.stringify(j,null,2);
+                            }catch(e){
+                                txt = await res.text();
+                            }
+                            document.getElementById('out').value = txt;
+                        }
+
                         async function runTerm(){
                             const t = document.getElementById('term').value.trim();
                             if(!t){ alert('Enter a term (use underscores for spaces)'); return }
                             const res = await fetch(`/terms/${encodeURIComponent(t)}/studies`);
-                            const j = await res.json();
-                            document.getElementById('out').value = JSON.stringify(j,null,2);
+                            await handleResponse(res);
                         }
+
                         async function runCoords(){
                             const c = document.getElementById('coords').value.trim();
                             if(!c){ alert('Enter coords as x_y_z'); return }
                             const res = await fetch(`/locations/${encodeURIComponent(c)}/studies`);
-                            const j = await res.json();
-                            document.getElementById('out').value = JSON.stringify(j,null,2);
+                            await handleResponse(res);
+                        }
+
+                        async function runDissociateTerms(){
+                            const a = document.getElementById('term_a').value.trim();
+                            const b = document.getElementById('term_b').value.trim();
+                            if(!a || !b){ alert('Enter both terms (use underscores for spaces)'); return }
+                            const res = await fetch(`/dissociate/terms/${encodeURIComponent(a)}/${encodeURIComponent(b)}`);
+                            await handleResponse(res);
                         }
                     </script>
                 </body>

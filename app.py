@@ -28,6 +28,22 @@ def get_engine():
 def create_app():
     app = Flask(__name__)
 
+    def _parse_wkt_point(wkt: str):
+        """Parse WKT POINT/Z text like 'POINT Z (x y z)' or 'POINT(x y z)' into [x,y,z] or None."""
+        if not wkt:
+            return None
+        try:
+            m = re.search(r"POINT(?:\s+Z)?\s*\(([^)]+)\)", wkt)
+            if not m:
+                return None
+            parts = m.group(1).strip().split()
+            nums = [float(p) for p in parts]
+            if len(nums) == 2:
+                nums.append(0.0)
+            return nums
+        except Exception:
+            return None
+
     @app.get("/", endpoint="health")
     def health():
         return "<p>Server working!</p>"
@@ -68,8 +84,8 @@ def create_app():
                 GROUP BY study_id
             )
          SELECT m.study_id, m.contrast_id, m.weight,
-             ST_X(c.geom::public.geometry) AS x, ST_Y(c.geom::public.geometry) AS y, ST_Z(c.geom::public.geometry) AS z,
-                   coalesce(tt.terms, '[]'::jsonb) AS top_terms
+             ST_AsText(c.geom) AS geom_wkt,
+             coalesce(tt.terms, '[]'::jsonb) AS top_terms
             FROM matched m
             LEFT JOIN ns.coordinates c ON m.study_id = c.study_id
             LEFT JOIN top_terms tt ON m.study_id = tt.study_id
@@ -83,11 +99,14 @@ def create_app():
 
             result = []
             for r in rows:
+                coords = None
+                if r.get("geom_wkt") is not None:
+                    coords = _parse_wkt_point(r.get("geom_wkt"))
                 result.append({
                     "study_id": r["study_id"],
                     "contrast_id": r["contrast_id"],
                     "weight_for_query_term": float(r["weight"]) if r["weight"] is not None else None,
-                    "coords": None if r["x"] is None else [float(r["x"]), float(r["y"]), float(r["z"])],
+                    "coords": coords,
                     "top_terms": (r["top_terms"] if r["top_terms"] is not None else [])[:5]
                 })
 
@@ -109,7 +128,7 @@ def create_app():
             WITH nearest AS (
                 SELECT study_id, geom
                 FROM ns.coordinates
-                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::public.geometry(POINTZ,4326)
+                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)
                 LIMIT :n
             ), top_terms AS (
                 SELECT study_id,
@@ -118,11 +137,11 @@ def create_app():
                 WHERE study_id IN (SELECT study_id FROM nearest)
                 GROUP BY study_id
             )
-            SELECT n.study_id, ST_X(n.geom::public.geometry) AS x, ST_Y(n.geom::public.geometry) AS y, ST_Z(n.geom::public.geometry) AS z,
+            SELECT n.study_id, ST_AsText(n.geom) AS geom_wkt,
                    coalesce(tt.terms, '[]'::jsonb) AS top_terms
             FROM nearest n
             LEFT JOIN top_terms tt ON n.study_id = tt.study_id
-            ORDER BY n.geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+            ORDER BY n.geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)
         """)
 
         eng = get_engine()
@@ -132,9 +151,12 @@ def create_app():
 
         result = []
         for r in rows:
+            coords = None
+            if r.get("geom_wkt") is not None:
+                coords = _parse_wkt_point(r.get("geom_wkt"))
             result.append({
                 "study_id": r["study_id"],
-                "coords": [float(r["x"]), float(r["y"]), float(r["z"])],
+                "coords": coords,
                 "top_terms": (r["top_terms"] if r["top_terms"] is not None else [])[:5]
             })
         return jsonify({"query_coords": [x, y, z], "count": len(result), "nearest": result})
@@ -187,7 +209,7 @@ def create_app():
                     in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
 
                     coords_rows = conn.execute(text(f"""
-                        SELECT study_id, ST_X(geom::public.geometry) AS x, ST_Y(geom::public.geometry) AS y, ST_Z(geom::public.geometry) AS z
+                        SELECT study_id, ST_AsText(geom) AS geom_wkt
                         FROM ns.coordinates
                         WHERE study_id IN ({in_clause})
                     """), params).mappings().all()
@@ -204,7 +226,11 @@ def create_app():
                         sid = tr["study_id"]
                         top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"]) if tr["weight"] is not None else None})
 
-                    coords_map = {r["study_id"]: [float(r["x"]), float(r["y"]), float(r["z"])] if r["x"] is not None else None for r in coords_rows}
+                    # parse WKT into coordinate lists
+                    coords_map = {}
+                    for r in coords_rows:
+                        wkt = r.get("geom_wkt")
+                        coords_map[r["study_id"]] = _parse_wkt_point(wkt)
 
                     results = []
                     for sid in study_ids:
@@ -286,7 +312,7 @@ def create_app():
                     in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
 
                     coords_rows = conn.execute(text(f"""
-                        SELECT study_id, ST_X(geom::public.geometry) AS x, ST_Y(geom::public.geometry) AS y, ST_Z(geom::public.geometry) AS z
+                        SELECT study_id, ST_AsText(geom) AS geom_wkt
                         FROM ns.coordinates
                         WHERE study_id IN ({in_clause})
                     """), params).mappings().all()
@@ -303,7 +329,10 @@ def create_app():
                         sid = tr["study_id"]
                         top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"]) if tr["weight"] is not None else None})
 
-                    coords_map = {r["study_id"]: [float(r["x"]), float(r["y"]), float(r["z"])] if r["x"] is not None else None for r in coords_rows}
+                    coords_map = {}
+                    for r in coords_rows:
+                        wkt = r.get("geom_wkt")
+                        coords_map[r["study_id"]] = _parse_wkt_point(wkt)
 
                     results = []
                     for sid in study_ids:

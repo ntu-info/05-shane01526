@@ -68,7 +68,7 @@ def create_app():
                 GROUP BY study_id
             )
          SELECT m.study_id, m.contrast_id, m.weight,
-             ST_X(c.geom::geometry) AS x, ST_Y(c.geom::geometry) AS y, ST_Z(c.geom::geometry) AS z,
+             ST_X(c.geom::public.geometry) AS x, ST_Y(c.geom::public.geometry) AS y, ST_Z(c.geom::public.geometry) AS z,
                    coalesce(tt.terms, '[]'::jsonb) AS top_terms
             FROM matched m
             LEFT JOIN ns.coordinates c ON m.study_id = c.study_id
@@ -109,7 +109,7 @@ def create_app():
             WITH nearest AS (
                 SELECT study_id, geom
                 FROM ns.coordinates
-                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::public.geometry(POINTZ,4326)
                 LIMIT :n
             ), top_terms AS (
                 SELECT study_id,
@@ -118,7 +118,7 @@ def create_app():
                 WHERE study_id IN (SELECT study_id FROM nearest)
                 GROUP BY study_id
             )
-            SELECT n.study_id, ST_X(n.geom::geometry) AS x, ST_Y(n.geom::geometry) AS y, ST_Z(n.geom::geometry) AS z,
+            SELECT n.study_id, ST_X(n.geom::public.geometry) AS x, ST_Y(n.geom::public.geometry) AS y, ST_Z(n.geom::public.geometry) AS z,
                    coalesce(tt.terms, '[]'::jsonb) AS top_terms
             FROM nearest n
             LEFT JOIN top_terms tt ON n.study_id = tt.study_id
@@ -187,7 +187,7 @@ def create_app():
                     in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
 
                     coords_rows = conn.execute(text(f"""
-                        SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z
+                        SELECT study_id, ST_X(geom::public.geometry) AS x, ST_Y(geom::public.geometry) AS y, ST_Z(geom::public.geometry) AS z
                         FROM ns.coordinates
                         WHERE study_id IN ({in_clause})
                     """), params).mappings().all()
@@ -286,7 +286,7 @@ def create_app():
                     in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
 
                     coords_rows = conn.execute(text(f"""
-                        SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z
+                        SELECT study_id, ST_X(geom::public.geometry) AS x, ST_Y(geom::public.geometry) AS y, ST_Z(geom::public.geometry) AS z
                         FROM ns.coordinates
                         WHERE study_id IN ({in_clause})
                     """), params).mappings().all()

@@ -4,6 +4,7 @@ import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
+import re
 
 _engine = None
 
@@ -38,14 +39,26 @@ def create_app():
     def get_studies_by_term(term):
         # Query DB for studies that mention `term` and include their coords + top terms
         eng = get_engine()
-        term_norm = term.replace("_", " ").lower()
+        # Normalize user input to the same canonical form used when importing terms
+        def norm_term_input(t: str) -> str:
+            if t is None:
+                return t
+            s = t.strip().lower()
+            # convert spaces to underscores and collapse multiple underscores
+            s = re.sub(r"\s+", "_", s)
+            s = re.sub(r"_+", "_", s)
+            s = s.strip("_")
+            return s
+
+        term_norm = norm_term_input(term)
         with eng.begin() as conn:
+            # normalize stored term in SQL: collapse spaces/underscores to single underscore and trim
             rows = conn.execute(text("""
                 SELECT at.study_id, at.contrast_id, at.weight,
                        ST_X(c.geom) AS x, ST_Y(c.geom) AS y, ST_Z(c.geom) AS z
                 FROM ns.annotations_terms at
                 LEFT JOIN ns.coordinates c ON at.study_id = c.study_id
-                WHERE at.term = :term
+                WHERE trim(both '_' from regexp_replace(lower(at.term), '[\\s_]+', '_', 'g')) = :term
                 ORDER BY at.weight DESC
                 LIMIT 100
             """), {"term": term_norm}).mappings().all()
@@ -134,7 +147,11 @@ def create_app():
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_terms(term_a, term_b):
         def norm_term(t):
-            return t.replace("_", " ").strip().lower()
+            # reuse same normalization as other endpoints
+            s = t.strip().lower()
+            s = re.sub(r"\s+", "_", s)
+            s = re.sub(r"_+", "_", s)
+            return s.strip("_")
 
         a_term = norm_term(term_a)
         b_term = norm_term(term_b)
@@ -145,17 +162,18 @@ def create_app():
                 conn.execute(text("SET search_path TO ns, public;"))
 
                 # Get study ids for each term (limit to 1000 to avoid huge IN lists)
+                # normalize term comparison in SQL to handle spaces/underscores/case
                 a_rows = conn.execute(text("""
                     SELECT DISTINCT study_id
                     FROM ns.annotations_terms
-                    WHERE term = :term
+                    WHERE trim(both '_' from regexp_replace(lower(term), '[\\s_]+', '_', 'g')) = :term
                     LIMIT 1000
                 """), {"term": a_term}).scalars().all()
 
                 b_rows = conn.execute(text("""
                     SELECT DISTINCT study_id
                     FROM ns.annotations_terms
-                    WHERE term = :term
+                    WHERE trim(both '_' from regexp_replace(lower(term), '[\\s_]+', '_', 'g')) = :term
                     LIMIT 1000
                 """), {"term": b_term}).scalars().all()
 

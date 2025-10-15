@@ -1,10 +1,11 @@
 # app.py
-from flask import Flask, jsonify, abort, send_file
+from flask import Flask, jsonify, abort, send_file, request
 import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 import re
+import traceback
 
 _engine = None
 
@@ -44,57 +45,57 @@ def create_app():
             if t is None:
                 return t
             s = t.strip().lower()
-            # convert spaces to underscores and collapse multiple underscores
             s = re.sub(r"\s+", "_", s)
             s = re.sub(r"_+", "_", s)
             s = s.strip("_")
             return s
 
         term_norm = norm_term_input(term)
-        with eng.begin() as conn:
-            # normalize stored term in SQL: collapse spaces/underscores to single underscore and trim
-            rows = conn.execute(text("""
-                SELECT at.study_id, at.contrast_id, at.weight,
-                       ST_X(c.geom) AS x, ST_Y(c.geom) AS y, ST_Z(c.geom) AS z
+
+        # Single SQL using CTEs: first find matched studies (limit 100), then aggregate top terms per study
+        sql = text(r"""
+            WITH matched AS (
+                SELECT at.study_id, at.contrast_id, at.weight
                 FROM ns.annotations_terms at
-                LEFT JOIN ns.coordinates c ON at.study_id = c.study_id
-                WHERE trim(both '_' from regexp_replace(lower(at.term), '[\\s_]+', '_', 'g')) = :term
+                WHERE trim(both '_' from regexp_replace(lower(at.term), '[\s_]+' , '_', 'g')) = :term
                 ORDER BY at.weight DESC
                 LIMIT 100
-            """), {"term": term_norm}).mappings().all()
+            ), top_terms AS (
+                SELECT study_id,
+                       jsonb_agg(jsonb_build_object('term', term, 'weight', weight) ORDER BY weight DESC) AS terms
+                FROM ns.annotations_terms
+                WHERE study_id IN (SELECT study_id FROM matched)
+                GROUP BY study_id
+            )
+         SELECT m.study_id, m.contrast_id, m.weight,
+             ST_X(c.geom::geometry) AS x, ST_Y(c.geom::geometry) AS y, ST_Z(c.geom::geometry) AS z,
+                   coalesce(tt.terms, '[]'::jsonb) AS top_terms
+            FROM matched m
+            LEFT JOIN ns.coordinates c ON m.study_id = c.study_id
+            LEFT JOIN top_terms tt ON m.study_id = tt.study_id
+            ORDER BY m.weight DESC;
+        """)
 
-            # Collect study ids to fetch top terms for each study
-            study_ids = list({r["study_id"] for r in rows})
-            if study_ids:
-                # Build IN clause safely
-                params = {f"id{i}": sid for i, sid in enumerate(study_ids)}
-                in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
-                term_rows = conn.execute(text(f"""
-                    SELECT study_id, term, weight
-                    FROM ns.annotations_terms
-                    WHERE study_id IN ({in_clause})
-                    ORDER BY study_id, weight DESC
-                """), params).mappings().all()
-            else:
-                term_rows = []
+        try:
+            eng = get_engine()
+            with eng.begin() as conn:
+                rows = conn.execute(sql, {"term": term_norm}).mappings().all()
 
-        # Aggregate top terms per study (top 5)
-        top_terms = {}
-        for tr in term_rows:
-            sid = tr["study_id"]
-            top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"])})
+            result = []
+            for r in rows:
+                result.append({
+                    "study_id": r["study_id"],
+                    "contrast_id": r["contrast_id"],
+                    "weight_for_query_term": float(r["weight"]) if r["weight"] is not None else None,
+                    "coords": None if r["x"] is None else [float(r["x"]), float(r["y"]), float(r["z"])],
+                    "top_terms": (r["top_terms"] if r["top_terms"] is not None else [])[:5]
+                })
 
-        result = []
-        for r in rows:
-            sid = r["study_id"]
-            result.append({
-                "study_id": sid,
-                "contrast_id": r["contrast_id"],
-                "weight_for_query_term": float(r["weight"]) if r["weight"] is not None else None,
-                "coords": None if r["x"] is None else [float(r["x"]), float(r["y"]), float(r["z"])],
-                "top_terms": top_terms.get(sid, [])[:5]
-            })
-        return jsonify({"query_term": term_norm, "count": len(result), "studies": result})
+            return jsonify({"query_term": term_norm, "count": len(result), "studies": result})
+        except Exception as e:
+            if request.args.get('debug') == '1':
+                return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+            raise
 
     @app.get("/locations/<coords>/studies", endpoint="locations_studies")
     def get_studies_by_coordinates(coords):
@@ -103,43 +104,38 @@ def create_app():
             x, y, z = map(float, coords.split("_"))
         except Exception:
             abort(400, "Invalid coordinates format; expected x_y_z")
-
-        eng = get_engine()
-        with eng.begin() as conn:
-            # Use KNN ordering (requires PostGIS + GIST on geom). Limit to 50 nearest studies.
-            rows = conn.execute(text("""
-                SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z
+        # Single SQL: find nearest N studies, then aggregate top terms per study using CTEs
+        sql = text(r"""
+            WITH nearest AS (
+                SELECT study_id, geom
                 FROM ns.coordinates
                 ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
-                LIMIT 50
-            """), {"x": x, "y": y, "z": z}).mappings().all()
+                LIMIT :n
+            ), top_terms AS (
+                SELECT study_id,
+                       jsonb_agg(jsonb_build_object('term', term, 'weight', weight) ORDER BY weight DESC) AS terms
+                FROM ns.annotations_terms
+                WHERE study_id IN (SELECT study_id FROM nearest)
+                GROUP BY study_id
+            )
+            SELECT n.study_id, ST_X(n.geom::geometry) AS x, ST_Y(n.geom::geometry) AS y, ST_Z(n.geom::geometry) AS z,
+                   coalesce(tt.terms, '[]'::jsonb) AS top_terms
+            FROM nearest n
+            LEFT JOIN top_terms tt ON n.study_id = tt.study_id
+            ORDER BY n.geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+        """)
 
-            study_ids = [r["study_id"] for r in rows]
-            if study_ids:
-                params = {f"id{i}": sid for i, sid in enumerate(study_ids)}
-                in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
-                term_rows = conn.execute(text(f"""
-                    SELECT study_id, term, weight
-                    FROM ns.annotations_terms
-                    WHERE study_id IN ({in_clause})
-                    ORDER BY study_id, weight DESC
-                """), params).mappings().all()
-            else:
-                term_rows = []
-
-        # Aggregate top terms per study (top 5)
-        top_terms = {}
-        for tr in term_rows:
-            sid = tr["study_id"]
-            top_terms.setdefault(sid, []).append({"term": tr["term"], "weight": float(tr["weight"])})
+        eng = get_engine()
+        N = 50
+        with eng.begin() as conn:
+            rows = conn.execute(sql, {"x": x, "y": y, "z": z, "n": N}).mappings().all()
 
         result = []
         for r in rows:
-            sid = r["study_id"]
             result.append({
-                "study_id": sid,
+                "study_id": r["study_id"],
                 "coords": [float(r["x"]), float(r["y"]), float(r["z"])],
-                "top_terms": top_terms.get(sid, [])[:5]
+                "top_terms": (r["top_terms"] if r["top_terms"] is not None else [])[:5]
             })
         return jsonify({"query_coords": [x, y, z], "count": len(result), "nearest": result})
     
@@ -463,5 +459,22 @@ def create_app():
                 return html
     return app
 
+    # Note: unreachable, kept for safety
+
 # WSGI entry point (no __main__)
 app = create_app()
+
+# Temporary global error handler for debugging: if ?debug=1 is present, return the exception and a short traceback
+@app.errorhandler(Exception)
+def _global_exception_handler(e):
+    from flask import request
+    import traceback, html
+    if request.args.get('debug') == '1':
+        tb = traceback.format_exc()
+        return jsonify({
+            'error': str(e),
+            'type': type(e).__name__,
+            'traceback': tb
+        }), 500
+    # Otherwise re-raise so normal logging/handlers apply
+    raise e

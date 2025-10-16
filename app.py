@@ -287,14 +287,14 @@ def create_app():
                 a_rows = conn.execute(text("""
                     SELECT study_id
                     FROM ns.coordinates
-                    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+                    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)
                     LIMIT :n
                 """), {"x": a[0], "y": a[1], "z": a[2], "n": N}).scalars().all()
 
                 b_rows = conn.execute(text("""
                     SELECT study_id
                     FROM ns.coordinates
-                    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)::geometry(POINTZ,4326)
+                    ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:x, :y, :z), 4326)
                     LIMIT :n
                 """), {"x": b[0], "y": b[1], "z": b[2], "n": N}).scalars().all()
 
@@ -382,9 +382,12 @@ def create_app():
                 # Samples
                 try:
                     rows = conn.execute(text(
-                        "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
+                        "SELECT study_id, ST_AsText(geom) AS geom_wkt FROM ns.coordinates LIMIT 3"
                     )).mappings().all()
-                    payload["coordinates_sample"] = [dict(r) for r in rows]
+                    payload["coordinates_sample"] = []
+                    for r in rows:
+                        coords = _parse_wkt_point(r.get('geom_wkt'))
+                        payload["coordinates_sample"].append({"study_id": r.get('study_id'), "coords": coords})
                 except Exception:
                     payload["coordinates_sample"] = []
 

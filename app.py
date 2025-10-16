@@ -68,25 +68,32 @@ def create_app():
 
         term_norm = norm_term_input(term)
 
-        # Single SQL using CTEs: first find matched studies (limit 100), then aggregate top terms per study
-        sql = text(r"""
+        # Two-step query: first find matched study_ids (limit small), then fetch coords and top terms only for those ids
+        sql_find = text(r"""
             WITH matched AS (
                 SELECT at.study_id, at.contrast_id, at.weight
                 FROM ns.annotations_terms at
                 WHERE trim(both '_' from regexp_replace(lower(at.term), '[\s_]+' , '_', 'g')) = :term
                 ORDER BY at.weight DESC
-                LIMIT 100
-            ), top_terms AS (
+                LIMIT :lim
+            )
+            SELECT study_id, contrast_id, weight FROM matched;
+        """)
+
+        sql_fetch = text(r"""
+            WITH top_terms AS (
                 SELECT study_id,
                        jsonb_agg(jsonb_build_object('term', term, 'weight', weight) ORDER BY weight DESC) AS terms
                 FROM ns.annotations_terms
                 WHERE study_id IN (SELECT study_id FROM matched)
                 GROUP BY study_id
             )
-         SELECT m.study_id, m.contrast_id, m.weight,
-             (c.geom::text) AS geom_wkt,
-             coalesce(tt.terms, '[]'::jsonb) AS top_terms
-            FROM matched m
+            SELECT m.study_id, m.contrast_id, m.weight,
+                   (c.geom::text) AS geom_wkt,
+                   coalesce(tt.terms, '[]'::jsonb) AS top_terms
+            FROM (
+                SELECT study_id, contrast_id, weight FROM matched
+            ) m
             LEFT JOIN ns.coordinates c ON m.study_id = c.study_id
             LEFT JOIN top_terms tt ON m.study_id = tt.study_id
             ORDER BY m.weight DESC;
@@ -94,8 +101,43 @@ def create_app():
 
         try:
             eng = get_engine()
+            LIMIT_SMALL = 50
             with eng.begin() as conn:
-                rows = conn.execute(sql, {"term": term_norm}).mappings().all()
+                # find top matched study ids
+                matched = conn.execute(sql_find, {"term": term_norm, "lim": LIMIT_SMALL}).mappings().all()
+                if not matched:
+                    return jsonify({"query_term": term_norm, "count": 0, "studies": []})
+                # create a temporary CTE 'matched' for the fetch query by using the DB-side WITH from a VALUES clause
+                # Build a VALUES list for matched study rows to avoid re-running the expensive normalization across the whole table
+                vals = ",".join([f"(:sid{i}, :cid{i}, :w{i})" for i in range(len(matched))])
+                params = {}
+                for i, row in enumerate(matched):
+                    params[f"sid{i}"] = row["study_id"]
+                    params[f"cid{i}"] = row["contrast_id"]
+                    params[f"w{i}"] = row["weight"]
+
+                fetch_sql = text(r"""
+                    WITH matched(study_id, contrast_id, weight) AS (
+                        VALUES
+                        """ + vals + r"""
+                    ),
+                    top_terms AS (
+                        SELECT study_id,
+                               jsonb_agg(jsonb_build_object('term', term, 'weight', weight) ORDER BY weight DESC) AS terms
+                        FROM ns.annotations_terms
+                        WHERE study_id IN (SELECT study_id FROM matched)
+                        GROUP BY study_id
+                    )
+                    SELECT m.study_id, m.contrast_id, m.weight,
+                           (c.geom::text) AS geom_wkt,
+                           coalesce(tt.terms, '[]'::jsonb) AS top_terms
+                    FROM matched m
+                    LEFT JOIN ns.coordinates c ON m.study_id = c.study_id
+                    LEFT JOIN top_terms tt ON m.study_id = tt.study_id
+                    ORDER BY m.weight DESC;
+                """)
+
+                rows = conn.execute(fetch_sql, params).mappings().all()
 
             result = []
             for r in rows:
@@ -110,6 +152,7 @@ def create_app():
                     "top_terms": (r["top_terms"] if r["top_terms"] is not None else [])[:5]
                 })
 
+            # Return a shape similar to /locations endpoint: query_term, count, studies
             return jsonify({"query_term": term_norm, "count": len(result), "studies": result})
         except Exception as e:
             if request.args.get('debug') == '1':
@@ -412,6 +455,21 @@ def create_app():
         except Exception as e:
             payload["error"] = str(e)
             return jsonify(payload), 500
+
+    @app.get('/debug/geom-type', endpoint='debug_geom')
+    def debug_geom_type():
+        """Return pg_typeof for ns.coordinates.geom and a sample geom::text to help diagnose PostGIS type issues."""
+        eng = get_engine()
+        try:
+            with eng.begin() as conn:
+                conn.execute(text("SET search_path TO ns, public;"))
+                t = conn.execute(text("SELECT pg_typeof(geom) AS t, (geom::text) AS sample FROM ns.coordinates LIMIT 1;"))
+                row = t.mappings().first()
+                if not row:
+                    return jsonify({"found": False, "msg": "no rows in ns.coordinates"}), 200
+                return jsonify({"found": True, "pg_typeof": str(row["t"]), "sample_text": row["sample"]}), 200
+        except Exception as e:
+            return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
         @app.get("/ui", endpoint="ui")
         def ui():

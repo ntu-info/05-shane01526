@@ -84,7 +84,7 @@ def create_app():
                 GROUP BY study_id
             )
          SELECT m.study_id, m.contrast_id, m.weight,
-             ST_AsText(c.geom) AS geom_wkt,
+             (c.geom::text) AS geom_wkt,
              coalesce(tt.terms, '[]'::jsonb) AS top_terms
             FROM matched m
             LEFT JOIN ns.coordinates c ON m.study_id = c.study_id
@@ -137,7 +137,7 @@ def create_app():
                 WHERE study_id IN (SELECT study_id FROM nearest)
                 GROUP BY study_id
             )
-            SELECT n.study_id, ST_AsText(n.geom) AS geom_wkt,
+            SELECT n.study_id, (n.geom::text) AS geom_wkt,
                    coalesce(tt.terms, '[]'::jsonb) AS top_terms
             FROM nearest n
             LEFT JOIN top_terms tt ON n.study_id = tt.study_id
@@ -209,7 +209,7 @@ def create_app():
                     in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
 
                     coords_rows = conn.execute(text(f"""
-                        SELECT study_id, ST_AsText(geom) AS geom_wkt
+                        SELECT study_id, (geom::text) AS geom_wkt
                         FROM ns.coordinates
                         WHERE study_id IN ({in_clause})
                     """), params).mappings().all()
@@ -312,7 +312,7 @@ def create_app():
                     in_clause = ", ".join([f":id{i}" for i in range(len(study_ids))])
 
                     coords_rows = conn.execute(text(f"""
-                        SELECT study_id, ST_AsText(geom) AS geom_wkt
+                        SELECT study_id, (geom::text) AS geom_wkt
                         FROM ns.coordinates
                         WHERE study_id IN ({in_clause})
                     """), params).mappings().all()

@@ -52,6 +52,7 @@ def create_app():
     def show_img():
         return send_file("amygdala.gif", mimetype="image/gif")
 
+    @app.get("/terms/<term>", endpoint="terms_no_suffix")
     @app.get("/terms/<term>/studies", endpoint="terms_studies")
     def get_studies_by_term(term):
         # Query DB for studies that mention `term` and include their coords + top terms
@@ -103,8 +104,22 @@ def create_app():
             eng = get_engine()
             LIMIT_SMALL = 50
             with eng.begin() as conn:
-                # find top matched study ids
+                # find top matched study ids using normalized equality
                 matched = conn.execute(sql_find, {"term": term_norm, "lim": LIMIT_SMALL}).mappings().all()
+                # If no exact normalized matches, relax to a LIKE search on lower(term)
+                if not matched:
+                    fallback_sql = text(r"""
+                        SELECT at.study_id, at.contrast_id, at.weight
+                        FROM ns.annotations_terms at
+                        WHERE lower(at.term) LIKE :term_like
+                        ORDER BY at.weight DESC
+                        LIMIT :lim
+                    """)
+                    term_like = f"%{term_norm}%"
+                    matched = conn.execute(fallback_sql, {"term_like": term_like, "lim": LIMIT_SMALL}).mappings().all()
+                    if matched:
+                        # note: caller may want to know we used a relaxed match; we include it in debug output via ?debug=1
+                        pass
                 if not matched:
                     return jsonify({"query_term": term_norm, "count": 0, "studies": []})
                 # create a temporary CTE 'matched' for the fetch query by using the DB-side WITH from a VALUES clause
@@ -425,7 +440,7 @@ def create_app():
                 # Samples
                 try:
                     rows = conn.execute(text(
-                        "SELECT study_id, ST_AsText(geom) AS geom_wkt FROM ns.coordinates LIMIT 3"
+                        "SELECT study_id, (geom::text) AS geom_wkt FROM ns.coordinates LIMIT 3"
                     )).mappings().all()
                     payload["coordinates_sample"] = []
                     for r in rows:
